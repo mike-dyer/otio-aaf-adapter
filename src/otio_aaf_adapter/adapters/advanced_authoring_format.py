@@ -1749,7 +1749,10 @@ def write_to_file(
             for otio_child in otio_track:
                 result = transcriber.transcribe(otio_child)
                 if result:
-                    transcriber.sequence.components.append(result)
+                    if isinstance(transcriber.sequence, aaf2.components.NestedScope):
+                        transcriber.sequence.slots.append(result)
+                    else:
+                        transcriber.sequence.components.append(result)
 
         # Always add a timecode track to the main composition mob.
         # This is required for compatibility with DaVinci Resolve.
