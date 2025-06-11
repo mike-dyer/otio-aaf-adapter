@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Tuple
 from typing import List
 from numbers import Rational
+from fractions import Fraction
 
 import aaf2
 import aaf2.mobs
@@ -21,6 +22,7 @@ import os
 import copy
 import re
 import logging
+import portion
 
 from typing import Dict, Any
 
@@ -51,8 +53,13 @@ AAF_PARAMETERDEF_CROPRIGHT = uuid.UUID("5ecc9dd5-21c1-462b-9fec-c2bd85f14033")
 AAF_PARAMETERDEF_CROPTOP = uuid.UUID("8170a539-9b55-4051-9d4e-46598d01b914")
 AAF_PARAMETERDEF_CROPBOTTOM = uuid.UUID("154ba82b-990a-4c80-9101-3037e28839a1")
 
+AAF_OPERATIONDEF_MONOGAIN = aaf2.auid.AUID("9d2ea894-0968-11d3-8a38-0050040ef7d2")
+AAF_PARAMETERDEF_GAIN = uuid.UUID("e4962321-2267-11d3-8a4c-0050040ef7d2")
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+from_rt = lambda x : Fraction(int(x.value), int(x.rate))
 
 def _is_considered_gap(thing):
     """Returns whether or not thiing can be considered gap.
@@ -1277,10 +1284,144 @@ class AudioTrackTranscriber(_TrackTranscriber):
             point["ControlPointSource"].value = cp_dict["ControlPointSource"]
             varying_value["PointList"].append(point)
 
-        opgroup = self.timeline_mobslot.segment
-        opgroup.parameters.append(varying_value)
+        self.opgrp_pan.parameters.append(varying_value)
 
-        return super().aaf_sourceclip(otio_clip)
+        return self._process_fades(otio_clip)
+
+    def _process_fades(self, otio_clip):
+        opdef_gain = self.aaf_file.create.OperationDef(AAF_OPERATIONDEF_MONOGAIN, "Audio Gain")
+        opdef_gain.media_kind = self.media_kind
+        opdef_gain["NumberInputs"].value = 1
+        self.aaf_file.dictionary.register_def(opdef_gain)
+
+        opgrp_gain = self.aaf_file.create.OperationGroup(opdef_gain)
+        opgrp_gain.media_kind = self.media_kind
+        opgrp_gain.length = int(otio_clip.duration().value)
+
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        param_def = self.aaf_file.create.ParameterDef(AAF_PARAMETERDEF_GAIN,
+                                                      "Gain",
+                                                      "Gain",
+                                                      typedef)
+        self.aaf_file.dictionary.register_def(param_def)
+
+        # Find fades that overlap this clip
+        range = otio_clip.range_in_parent()
+        interval = portion.closedopen(range.start_time.to_seconds(), (range.start_time + range.duration).to_seconds())
+        fades = [f for f in self._fades if interval.overlaps(f["interval"])]
+
+        if not fades:
+            # This clip is not overlapped by any fade
+            # We need to check if there was a previous fade out, however
+            # and if so, set the constant gain to 0.
+            gain = self._gain
+
+            prev = [f for f in self._fades if f["interval"] < interval]
+            if prev:
+                gain = gain * prev[-1]["out"]
+                logger.debug(f"Setting constant gain to {gain} due to prior fade")
+
+            const_gain = self.aaf_file.create.ConstantValue()
+            const_gain.parameterdef = param_def
+            const_gain.value = aaf2.rational.AAFRational(Fraction(gain))
+            opgrp_gain.parameters.append(const_gain)
+            logger.debug(f"Created constant gain: {const_gain.value}")
+        else:
+            interp_def = self.aaf_file.create.InterpolationDef(aaf2.misc.LinearInterp,
+                                                   "LinearInterp",
+                                                   "LinearInterp")
+            self.aaf_file.dictionary.register_def(interp_def)
+
+            varying_gain = self.aaf_file.create.VaryingValue()
+            varying_gain.parameterdef = param_def
+            varying_gain["Interpolation"].value = interp_def
+
+            logger.debug(f'fades: {fades}')
+
+            # Calculate in and out points for each fade, as a proportion of overlapped time
+            prev = None
+            for f in fades:
+                isct = interval.intersection(f["interval"])
+
+                fade_at = lambda x : f["in"] + ((x - f["interval"].lower) * (f["out"] - f["in"])) / (f["interval"].upper - f["interval"].lower)
+
+                start = Fraction(isct.lower) - from_rt(range.start_time) # in clip time
+                end = Fraction(isct.upper) - from_rt(range.start_time)   # in clip time
+
+                if prev != Fraction(self._gain * fade_at(isct.lower)):
+                    pnt_in = self.aaf_file.create.ControlPoint()
+                    pnt_in["Time"].value = aaf2.rational.AAFRational(start / from_rt(otio_clip.duration()))
+                    pnt_in["Value"].value = aaf2.rational.AAFRational(Fraction(self._gain * fade_at(isct.lower)))
+                    pnt_in["ControlPointSource"].value = 2
+                    varying_gain["PointList"].append(pnt_in)
+                    logger.debug(f'gain at {start / from_rt(otio_clip.duration())} == {Fraction(self._gain * fade_at(isct.lower))}')
+
+                pnt_out = self.aaf_file.create.ControlPoint()
+                pnt_out["Time"].value = aaf2.rational.AAFRational(end / from_rt(otio_clip.duration()))
+                pnt_out["Value"].value = aaf2.rational.AAFRational(Fraction(self._gain * fade_at(isct.upper)))
+                pnt_out["ControlPointSource"].value = 2
+                varying_gain["PointList"].append(pnt_out)
+
+                logger.debug(f'gain at {end / from_rt(otio_clip.duration())} == {Fraction(self._gain * fade_at(isct.upper))}')
+
+                prev = Fraction(self._gain * fade_at(isct.upper))
+
+            opgrp_gain.parameters.append(varying_gain)
+
+        opgrp_gain.segments.append(super().aaf_sourceclip(otio_clip))
+
+        return opgrp_gain
+
+    def _parse_track_gain(self):
+        self._gain = 1.0
+        gains = [g for g in self.otio_track.effects if isinstance(g, otio.schema.AudioVolume)]
+        for g in gains:
+            self._gain = self._gain * g.gain
+
+    def _parse_track_fades(self):
+        fades = [f for f in self.otio_track.effects if isinstance(f, otio.schema.AudioFade)]
+        fades.sort(key=lambda f: f.start_time)
+
+        # a fade is an interval (open right), with an in and out gain
+        self._fades = []
+        for f in fades:
+            interval = portion.closedopen(f.start_time, f.start_time + f.duration)
+            val = 0.0 if f.fade_in else 1.0
+
+            if not self._fades:
+                # Special case first entry
+                if f.start_time != 0:
+                    # make a flat zone
+                    self._fades.append({
+                        "interval" : portion.closedopen(0.0, f.start_time),
+                        "in" : val,
+                        "out" : val
+                    })
+                else:
+                    self._fades.append({
+                        "interval" : interval,
+                        "in" : val,
+                        "out" : 1.0 - val
+                    })
+                    continue
+
+            prev = self._fades[-1]
+            if not prev["interval"].adjacent(interval):
+                # Make a flat zone
+                if prev["out"] != val:
+                    raise RuntimeError(f"Two fades of same type in sequence {prev} : {f}")
+
+                self._fades.append({
+                    "interval" : portion.closedopen(prev["interval"].upper, interval.lower),
+                    "in" : val,
+                    "out" : val
+                })
+
+            self._fades.append({
+                "interval" : interval,
+                "in" : val,
+                "out" : 1.0 - val
+            })
 
     def _create_timeline_mobslot(self):
         """
@@ -1289,6 +1430,9 @@ class AudioTrackTranscriber(_TrackTranscriber):
 
         TimelineMobSlot --> OperationGroup --> Sequence
         """
+        self._parse_track_gain()
+        self._parse_track_fades()
+
         # TimelineMobSlot
         timeline_mobslot = self.compositionmob.create_sound_slot(
             edit_rate=self.edit_rate)
@@ -1300,15 +1444,16 @@ class AudioTrackTranscriber(_TrackTranscriber):
         self.aaf_file.dictionary.register_def(opdef)
         # OperationGroup
         total_length = int(sum([t.duration().value for t in self.otio_track]))
-        opgroup = self.aaf_file.create.OperationGroup(opdef)
-        opgroup.media_kind = self.media_kind
-        opgroup.length = total_length
-        timeline_mobslot.segment = opgroup
+        self.opgrp_pan = self.aaf_file.create.OperationGroup(opdef)
+        self.opgrp_pan.media_kind = self.media_kind
+        self.opgrp_pan.length = total_length
+        timeline_mobslot.segment = self.opgrp_pan
+
         # Sequence
         sequence = self.aaf_file.create.Sequence(media_kind=self.media_kind)
         sequence.components.value = []
         sequence.length = total_length
-        opgroup.segments.append(sequence)
+        self.opgrp_pan.segments.append(sequence)
         return timeline_mobslot, sequence
 
     def default_descriptor(self, otio_clip):
