@@ -26,7 +26,6 @@ import portion
 
 from typing import Dict, Any
 
-
 AAF_PARAMETERDEF_PAN = aaf2.auid.AUID("e4962322-2267-11d3-8a4c-0050040ef7d2")
 AAF_OPERATIONDEF_MONOAUDIOPAN = aaf2.auid.AUID("9d2ea893-0968-11d3-8a38-0050040ef7d2")
 AAF_PARAMETERDEF_AVIDPARAMETERBYTEORDER = uuid.UUID(
@@ -57,7 +56,6 @@ AAF_OPERATIONDEF_MONOGAIN = aaf2.auid.AUID("9d2ea894-0968-11d3-8a38-0050040ef7d2
 AAF_PARAMETERDEF_GAIN = uuid.UUID("e4962321-2267-11d3-8a4c-0050040ef7d2")
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 from_rt = lambda x : Fraction(int(x.value), int(x.rate))
 
@@ -144,6 +142,9 @@ class AAFFileTranscriber:
         self._unique_tapemobs = {}
         self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio, **kwargs)
 
+        self._canvas_size = input_otio.canvas_size
+        logger.debug(f'canvas: {self._canvas_size}')
+
         # transcribe timeline comments onto composition mob
         self._transcribe_user_comments(input_otio, self.compositionmob)
         self._transcribe_mob_attributes(input_otio, self.compositionmob)
@@ -213,7 +214,8 @@ class AAFFileTranscriber:
         if otio_track.kind == otio.schema.TrackKind.Video:
             transcriber = VideoTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
-                                                create_edgecode=self.create_edgecode)
+                                                create_edgecode=self.create_edgecode,
+                                                canvas_size=self._canvas_size)
         elif otio_track.kind == otio.schema.TrackKind.Audio:
             transcriber = AudioTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
@@ -926,7 +928,11 @@ class _TrackTranscriber:
 
 class VideoTrackTranscriber(_TrackTranscriber):
     """Video track kind specialization of TrackTranscriber."""
-
+    def __init__(self, root_file_transcriber, otio_track,
+                 embed_essence, create_edgecode, canvas_size):
+        self._canvas_size = canvas_size
+        super().__init__(root_file_transcriber, otio_track,
+                         embed_essence, create_edgecode)
     @property
     def media_kind(self):
         return "picture"
@@ -935,7 +941,7 @@ class VideoTrackTranscriber(_TrackTranscriber):
     def _master_mob_slot_id(self):
         return 1
 
-    def _add_scale_params(self, effect, op_grp):
+    def _add_scale_params(self, effect, op_grp, original_width, original_height):
         """ Add scale parameters """
 
         # Create ParameterDefs for scale X and Y
@@ -952,19 +958,21 @@ class VideoTrackTranscriber(_TrackTranscriber):
         # Create ConstantValues for scale X and Y
         const_scale_x = self.aaf_file.create.ConstantValue()
         const_scale_x.parameterdef = paramdef_scale_x
-        const_scale_x.value = effect.width
+        const_scale_x.value = aaf2.rational.AAFRational(effect.width, original_width)
 
         const_scale_y = self.aaf_file.create.ConstantValue()
         const_scale_y.parameterdef = paramdef_scale_y
-        const_scale_y.value = effect.height
+        const_scale_y.value = aaf2.rational.AAFRational(effect.height, original_height)
 
-        logger.info(f"Scaling to {effect.width} x {effect.height}")
+        logger.info(f"Scaling to {aaf2.rational.AAFRational(effect.width, original_width)} x {aaf2.rational.AAFRational(effect.height, original_height)}")
 
         # Add ConstantValues to the scale operation group
         op_grp.parameters.append(const_scale_x)
         op_grp.parameters.append(const_scale_y)
 
-    def _add_crop_params(self, effect, op_grp):
+        return effect.width, effect.height
+
+    def _add_crop_params(self, effect, op_grp, width, height):
         """ Add crop parameters """
 
         # Create ParameterDefs for crop left, top, right, bottom
@@ -986,24 +994,30 @@ class VideoTrackTranscriber(_TrackTranscriber):
         self.aaf_file.dictionary.register_def(paramdef_crop_right)
         self.aaf_file.dictionary.register_def(paramdef_crop_bottom)
 
+        left = aaf2.rational.AAFRational((2 * effect.left) - width, width)
+        right = aaf2.rational.AAFRational(width - (2 * effect.right), width)
+        top = aaf2.rational.AAFRational((2 * effect.top) - height, height)
+        bottom = aaf2.rational.AAFRational(height - (2 * effect.bottom), height)
+
         # Create ConstantValues for crop left, top, right, bottom
         const_crop_left = self.aaf_file.create.ConstantValue()
         const_crop_left.parameterdef = paramdef_crop_left
-        const_crop_left.value = effect.left
+        const_crop_left.value = left
 
         const_crop_top = self.aaf_file.create.ConstantValue()
         const_crop_top.parameterdef = paramdef_crop_top
-        const_crop_top.value = effect.top
+        const_crop_top.value = top
 
         const_crop_right = self.aaf_file.create.ConstantValue()
         const_crop_right.parameterdef = paramdef_crop_right
-        const_crop_right.value = effect.right
+        const_crop_right.value = right
 
         const_crop_bottom = self.aaf_file.create.ConstantValue()
         const_crop_bottom.parameterdef = paramdef_crop_bottom
-        const_crop_bottom.value = effect.bottom
+        const_crop_bottom.value = bottom
 
-        logger.info(f"Cropping to {effect.left}, {effect.top} -> {effect.right}, {effect.bottom}")
+        logger.info(f"Cropping to {effect.left}, {effect.top} -> {width - effect.right}, {height - effect.bottom}")
+        logger.info(f"Crop Rationals: {left}, {top}, {right}, {bottom}")
 
         # Add ConstantValues to the crop operation group
         op_grp.parameters.append(const_crop_left)
@@ -1011,7 +1025,9 @@ class VideoTrackTranscriber(_TrackTranscriber):
         op_grp.parameters.append(const_crop_right)
         op_grp.parameters.append(const_crop_bottom)
 
-    def _add_position_params(self, effect, op_grp):
+        return (width - effect.left - effect.right), (height - effect.top - effect.bottom), effect.left, effect.top
+
+    def _add_position_params(self, effect, op_grp, shift_left, shift_down):
         """ Add position parameters """
 
         # Create ParameterDefs for position X and Y
@@ -1026,15 +1042,18 @@ class VideoTrackTranscriber(_TrackTranscriber):
         self.aaf_file.dictionary.register_def(paramdef_pos_y)
 
         # Create ConstantValues for position X and Y
+        x = aaf2.rational.AAFRational(2 * (effect.x - shift_left), int(self._canvas_size.x))
         const_pos_x = self.aaf_file.create.ConstantValue()
         const_pos_x.parameterdef = paramdef_pos_x
-        const_pos_x.value = effect.x
+        const_pos_x.value = x
 
+        y = aaf2.rational.AAFRational(2 * (effect.y - shift_down), int(self._canvas_size.y))
         const_pos_y = self.aaf_file.create.ConstantValue()
         const_pos_y.parameterdef = paramdef_pos_y
-        const_pos_y.value = effect.y
+        const_pos_y.value = y
 
-        logger.info(f"Shifting to {effect.x}, {effect.y}")
+        logger.info(f"Shifting to {effect.x - shift_left}, {effect.y - shift_down}")
+        logger.info(f"Shifting floats {float(x)}, {float(y)}")
 
         # Add ConstantValues to the position operation group
         op_grp.parameters.append(const_pos_x)
@@ -1058,9 +1077,19 @@ class VideoTrackTranscriber(_TrackTranscriber):
     def aaf_sourceclip(self, otio_clip):
         source_clip = super().aaf_sourceclip(otio_clip)
 
+        descriptor = otio_clip.media_reference.metadata.get("AAF", {}).get(
+            "EssenceDescription", {})
+
         reversed_effects = []
         for e in otio_clip.effects:
             reversed_effects.insert(0, e)
+
+        width = descriptor["StoredWidth"]
+        height = descriptor["StoredHeight"]
+
+        shift_left = (int(self._canvas_size.x) - width) // 2
+        shift_down = (int(self._canvas_size.y) - height) // 2
+        logger.debug(f'Starting shift: {shift_left}, {shift_down}')
 
         next = source_clip
         length = int(otio_clip.duration().value)
@@ -1068,17 +1097,25 @@ class VideoTrackTranscriber(_TrackTranscriber):
             if isinstance(e, otio.schema.VideoScale):
                 logger.debug(f"Processing VideoScale effect: {e}")
                 op_grp = self._chain_operation(AAF_OPERATIONDEF_VIDEOSCALE, "Video Scale", length, next)
-                self._add_scale_params(e, op_grp)
+                scaled_width, scaled_height = self._add_scale_params(e, op_grp, width, height)
+                shift_left = shift_left + (width - scaled_width) // 2
+                shift_down = shift_down + (height - scaled_height) // 2
+                (width, height) = (scaled_width, scaled_height)
+                logger.debug(f'Post scale shift: {shift_left}, {shift_down}')
                 next = op_grp
             elif isinstance(e, otio.schema.VideoCrop):
                 logger.debug(f"Processing VideoCrop effect: {e}")
                 op_grp = self._chain_operation(AAF_OPERATIONDEF_VIDEOCROP, "Video Crop", length, next)
-                self._add_crop_params(e, op_grp)
+                width, height, x, y = self._add_crop_params(e, op_grp, width, height)
+                shift_left = shift_left + x
+                shift_down = shift_down + y
+                logger.debug(f'Post crop shift: {shift_left}, {shift_down}')
                 next = op_grp
             elif isinstance(e, otio.schema.VideoPosition):
                 logger.debug(f"Processing VideoPosition effect: {e}")
                 op_grp = self._chain_operation(AAF_OPERATIONDEF_VIDEOPOSITION, "Video Position", length, next)
-                self._add_position_params(e, op_grp)
+                self._add_position_params(e, op_grp, shift_left, shift_down)
+                shift_left = shift_down = 0
                 next = op_grp
             else:
                 logger.warning(f"Unsupported video effect: {e}")
