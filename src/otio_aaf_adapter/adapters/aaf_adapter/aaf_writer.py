@@ -5,6 +5,7 @@
 
 Specifies how to transcribe an OpenTimelineIO file into an AAF file.
 """
+import aaf2.rational
 from . import hooks
 
 from pathlib import Path
@@ -51,6 +52,7 @@ AAF_PARAMETERDEF_CROPLEFT = uuid.UUID("d47b3377-318c-4657-a9d8-75811b6dc3d1")
 AAF_PARAMETERDEF_CROPRIGHT = uuid.UUID("5ecc9dd5-21c1-462b-9fec-c2bd85f14033")
 AAF_PARAMETERDEF_CROPTOP = uuid.UUID("8170a539-9b55-4051-9d4e-46598d01b914")
 AAF_PARAMETERDEF_CROPBOTTOM = uuid.UUID("154ba82b-990a-4c80-9101-3037e28839a1")
+AAF_PARAMETERDEF_ROTATION = uuid.UUID("062cfbd8-f4b1-4a50-b944-f39e2fc73c17")
 
 AAF_OPERATIONDEF_MONOGAIN = aaf2.auid.AUID("9d2ea894-0968-11d3-8a38-0050040ef7d2")
 AAF_PARAMETERDEF_GAIN = uuid.UUID("e4962321-2267-11d3-8a4c-0050040ef7d2")
@@ -1059,6 +1061,23 @@ class VideoTrackTranscriber(_TrackTranscriber):
         op_grp.parameters.append(const_pos_x)
         op_grp.parameters.append(const_pos_y)
 
+    def _add_rotate_params(self, effect, op_grp):
+        # Create ParameterDefs for rotation
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        paramdef_angle = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_ROTATION, "angle", "angle", typedef
+        )
+        self.aaf_file.dictionary.register_def(paramdef_angle)
+
+        a = Fraction(effect.angle) / 360
+        const_angle = self.aaf_file.create.ConstantValue()
+        const_angle.parameterdef = paramdef_angle
+        const_angle.value = aaf2.rational.AAFRational(a)
+
+        logger.info(f"Rotating by 360 * {a}")
+
+        op_grp.parameters.append(const_angle)
+
     def _chain_operation(self, op_uuid, op_name, length, next):
         # Create OperationDefinition
         op_def = self.aaf_file.create.OperationDef(op_uuid, op_name)
@@ -1096,27 +1115,28 @@ class VideoTrackTranscriber(_TrackTranscriber):
         for e in otio_clip.effects:
             if isinstance(e, otio.schema.VideoScale):
                 logger.debug(f"Processing VideoScale effect: {e}")
-                op_grp = self._chain_operation(AAF_OPERATIONDEF_VIDEOSCALE, "Video Scale", length, next)
-                scaled_width, scaled_height = self._add_scale_params(e, op_grp, width, height)
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOSCALE, "Video Scale", length, next)
+                scaled_width, scaled_height = self._add_scale_params(e, next, width, height)
                 shift_left = shift_left + (width - scaled_width) // 2
                 shift_down = shift_down + (height - scaled_height) // 2
                 (width, height) = (scaled_width, scaled_height)
                 logger.debug(f'Post scale shift: {shift_left}, {shift_down}')
-                next = op_grp
             elif isinstance(e, otio.schema.VideoCrop):
                 logger.debug(f"Processing VideoCrop effect: {e}")
-                op_grp = self._chain_operation(AAF_OPERATIONDEF_VIDEOCROP, "Video Crop", length, next)
-                width, height, x, y = self._add_crop_params(e, op_grp, width, height)
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOCROP, "Video Crop", length, next)
+                width, height, x, y = self._add_crop_params(e, next, width, height)
                 shift_left = shift_left + x
                 shift_down = shift_down + y
                 logger.debug(f'Post crop shift: {shift_left}, {shift_down}')
-                next = op_grp
             elif isinstance(e, otio.schema.VideoPosition):
                 logger.debug(f"Processing VideoPosition effect: {e}")
-                op_grp = self._chain_operation(AAF_OPERATIONDEF_VIDEOPOSITION, "Video Position", length, next)
-                self._add_position_params(e, op_grp, shift_left, shift_down)
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOPOSITION, "Video Position", length, next)
+                self._add_position_params(e, next, shift_left, shift_down)
                 shift_left = shift_down = 0
-                next = op_grp
+            elif isinstance(e, otio.schema.VideoRotate):
+                logger.debug(f"Processing VideoRotation effect: {e}")
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOROTATE, "Video Rotate", length, next)
+                self._add_rotate_params(e, next)
             else:
                 logger.warning(f"Unsupported video effect: {e}")
 
