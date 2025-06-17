@@ -5,12 +5,14 @@
 
 Specifies how to transcribe an OpenTimelineIO file into an AAF file.
 """
+import aaf2.rational
 from . import hooks
 
 from pathlib import Path
 from typing import Tuple
 from typing import List
 from numbers import Rational
+from fractions import Fraction
 
 import aaf2
 import aaf2.mobs
@@ -21,9 +23,9 @@ import os
 import copy
 import re
 import logging
+import portion
 
 from typing import Dict, Any
-
 
 AAF_PARAMETERDEF_PAN = aaf2.auid.AUID("e4962322-2267-11d3-8a4c-0050040ef7d2")
 AAF_OPERATIONDEF_MONOAUDIOPAN = aaf2.auid.AUID("9d2ea893-0968-11d3-8a38-0050040ef7d2")
@@ -37,8 +39,27 @@ AAF_PARAMETERDEF_LEVEL = uuid.UUID("e4962320-2267-11d3-8a4c-0050040ef7d2")
 AAF_VVAL_EXTRAPOLATION_ID = uuid.UUID("0e24dd54-66cd-4f1a-b0a0-670ac3a7a0b3")
 AAF_OPERATIONDEF_SUBMASTER = uuid.UUID("f1db0f3d-8d64-11d3-80df-006008143e6f")
 
+AAF_OPERATIONDEF_VIDEOPOSITION = aaf2.auid.AUID("86f5711e-ee72-450c-a118-17cf3b175dff")
+AAF_OPERATIONDEF_VIDEOCROP = aaf2.auid.AUID("f5826680-26c5-4149-8554-43d3c7a3bc09")
+AAF_OPERATIONDEF_VIDEOSCALE = aaf2.auid.AUID("2e0a119d-e6f7-4bee-b5dc-6dd42988687e")
+AAF_OPERATIONDEF_VIDEOROTATE = aaf2.auid.AUID("f2ca330d-8d45-4db4-b1b5-136ab055586f")
+
+AAF_PARAMETERDEF_SCALEY = uuid.UUID("8d568129-847e-11d5-935a-50f857c10000")
+AAF_PARAMETERDEF_SCALEX = uuid.UUID("8D56812A-847E-11D5-935A-50F857C10000")
+AAF_PARAMETERDEF_POSX = uuid.UUID("c573a510-071a-454f-b617-ad6ae69054c2")
+AAF_PARAMETERDEF_POSY = uuid.UUID("82e27478-1336-4ea3-bcb9-6b8f17864c42")
+AAF_PARAMETERDEF_CROPLEFT = uuid.UUID("d47b3377-318c-4657-a9d8-75811b6dc3d1")
+AAF_PARAMETERDEF_CROPRIGHT = uuid.UUID("5ecc9dd5-21c1-462b-9fec-c2bd85f14033")
+AAF_PARAMETERDEF_CROPTOP = uuid.UUID("8170a539-9b55-4051-9d4e-46598d01b914")
+AAF_PARAMETERDEF_CROPBOTTOM = uuid.UUID("154ba82b-990a-4c80-9101-3037e28839a1")
+AAF_PARAMETERDEF_ROTATION = uuid.UUID("062cfbd8-f4b1-4a50-b944-f39e2fc73c17")
+
+AAF_OPERATIONDEF_MONOGAIN = aaf2.auid.AUID("9d2ea894-0968-11d3-8a38-0050040ef7d2")
+AAF_PARAMETERDEF_GAIN = uuid.UUID("e4962321-2267-11d3-8a4c-0050040ef7d2")
+
 logger = logging.getLogger(__name__)
 
+from_rt = lambda x : Fraction(int(x.value), int(x.rate))
 
 def _is_considered_gap(thing):
     """Returns whether or not thiing can be considered gap.
@@ -123,6 +144,9 @@ class AAFFileTranscriber:
         self._unique_tapemobs = {}
         self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio, **kwargs)
 
+        self._canvas_size = input_otio.canvas_size
+        logger.debug(f'canvas: {self._canvas_size}')
+
         # transcribe timeline comments onto composition mob
         self._transcribe_user_comments(input_otio, self.compositionmob)
         self._transcribe_mob_attributes(input_otio, self.compositionmob)
@@ -192,7 +216,8 @@ class AAFFileTranscriber:
         if otio_track.kind == otio.schema.TrackKind.Video:
             transcriber = VideoTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
-                                                create_edgecode=self.create_edgecode)
+                                                create_edgecode=self.create_edgecode,
+                                                canvas_size=self._canvas_size)
         elif otio_track.kind == otio.schema.TrackKind.Audio:
             transcriber = AudioTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
@@ -422,15 +447,19 @@ class _TrackTranscriber:
             filler = self.aaf_filler(otio_child)
             return filler
         elif isinstance(otio_child, otio.schema.Transition):
+            logger.info(f"Transcribing transition: {otio_child.name}")
             transition = self.aaf_transition(otio_child)
             return transition
         elif isinstance(otio_child, otio.schema.Clip):
+            logger.info(f"Transcribing clip: {otio_child.name}")
             source_clip = self.aaf_sourceclip(otio_child)
             return source_clip
         elif isinstance(otio_child, otio.schema.Track):
+            logger.info(f"Transcribing track: {otio_child.name}")
             sequence = self.aaf_sequence(otio_child)
             return sequence
         elif isinstance(otio_child, otio.schema.Stack):
+            logger.info(f"Transcribing stack: {otio_child.name}")
             operation_group = self.aaf_operation_group(otio_child)
             return operation_group
         else:
@@ -901,7 +930,11 @@ class _TrackTranscriber:
 
 class VideoTrackTranscriber(_TrackTranscriber):
     """Video track kind specialization of TrackTranscriber."""
-
+    def __init__(self, root_file_transcriber, otio_track,
+                 embed_essence, create_edgecode, canvas_size):
+        self._canvas_size = canvas_size
+        super().__init__(root_file_transcriber, otio_track,
+                         embed_essence, create_edgecode)
     @property
     def media_kind(self):
         return "picture"
@@ -909,6 +942,205 @@ class VideoTrackTranscriber(_TrackTranscriber):
     @property
     def _master_mob_slot_id(self):
         return 1
+
+    def _add_scale_params(self, effect, op_grp, original_width, original_height):
+        """ Add scale parameters """
+
+        # Create ParameterDefs for scale X and Y
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        paramdef_scale_x = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_SCALEX, "ScaleX", "Scale X", typedef
+        )
+        paramdef_scale_y = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_SCALEY, "ScaleY", "Scale Y", typedef
+        )
+        self.aaf_file.dictionary.register_def(paramdef_scale_x)
+        self.aaf_file.dictionary.register_def(paramdef_scale_y)
+
+        # Create ConstantValues for scale X and Y
+        const_scale_x = self.aaf_file.create.ConstantValue()
+        const_scale_x.parameterdef = paramdef_scale_x
+        const_scale_x.value = aaf2.rational.AAFRational(effect.width, original_width)
+
+        const_scale_y = self.aaf_file.create.ConstantValue()
+        const_scale_y.parameterdef = paramdef_scale_y
+        const_scale_y.value = aaf2.rational.AAFRational(effect.height, original_height)
+
+        logger.info(f"Scaling to {aaf2.rational.AAFRational(effect.width, original_width)} x {aaf2.rational.AAFRational(effect.height, original_height)}")
+
+        # Add ConstantValues to the scale operation group
+        op_grp.parameters.append(const_scale_x)
+        op_grp.parameters.append(const_scale_y)
+
+        return effect.width, effect.height
+
+    def _add_crop_params(self, effect, op_grp, width, height):
+        """ Add crop parameters """
+
+        # Create ParameterDefs for crop left, top, right, bottom
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        paramdef_crop_left = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_CROPLEFT, "CropLeft", "Crop Left", typedef
+        )
+        paramdef_crop_top = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_CROPTOP, "CropTop", "Crop Top", typedef
+        )
+        paramdef_crop_right = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_CROPRIGHT, "CropRight", "Crop Right", typedef
+        )
+        paramdef_crop_bottom = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_CROPBOTTOM, "CropBottom", "Crop Bottom", typedef
+        )
+        self.aaf_file.dictionary.register_def(paramdef_crop_left)
+        self.aaf_file.dictionary.register_def(paramdef_crop_top)
+        self.aaf_file.dictionary.register_def(paramdef_crop_right)
+        self.aaf_file.dictionary.register_def(paramdef_crop_bottom)
+
+        left = aaf2.rational.AAFRational((2 * effect.left) - width, width)
+        right = aaf2.rational.AAFRational(width - (2 * effect.right), width)
+        top = aaf2.rational.AAFRational((2 * effect.top) - height, height)
+        bottom = aaf2.rational.AAFRational(height - (2 * effect.bottom), height)
+
+        # Create ConstantValues for crop left, top, right, bottom
+        const_crop_left = self.aaf_file.create.ConstantValue()
+        const_crop_left.parameterdef = paramdef_crop_left
+        const_crop_left.value = left
+
+        const_crop_top = self.aaf_file.create.ConstantValue()
+        const_crop_top.parameterdef = paramdef_crop_top
+        const_crop_top.value = top
+
+        const_crop_right = self.aaf_file.create.ConstantValue()
+        const_crop_right.parameterdef = paramdef_crop_right
+        const_crop_right.value = right
+
+        const_crop_bottom = self.aaf_file.create.ConstantValue()
+        const_crop_bottom.parameterdef = paramdef_crop_bottom
+        const_crop_bottom.value = bottom
+
+        logger.info(f"Cropping to {effect.left}, {effect.top} -> {width - effect.right}, {height - effect.bottom}")
+        logger.info(f"Crop Rationals: {left}, {top}, {right}, {bottom}")
+
+        # Add ConstantValues to the crop operation group
+        op_grp.parameters.append(const_crop_left)
+        op_grp.parameters.append(const_crop_top)
+        op_grp.parameters.append(const_crop_right)
+        op_grp.parameters.append(const_crop_bottom)
+
+        return (width - effect.left - effect.right), (height - effect.top - effect.bottom), effect.left, effect.top
+
+    def _add_position_params(self, effect, op_grp, shift_left, shift_down):
+        """ Add position parameters """
+
+        # Create ParameterDefs for position X and Y
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        paramdef_pos_x = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_POSX, "PositionX", "Position X", typedef
+        )
+        paramdef_pos_y = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_POSY, "PositionY", "Position Y", typedef
+        )
+        self.aaf_file.dictionary.register_def(paramdef_pos_x)
+        self.aaf_file.dictionary.register_def(paramdef_pos_y)
+
+        # Create ConstantValues for position X and Y
+        x = aaf2.rational.AAFRational(2 * (effect.x - shift_left), int(self._canvas_size.x))
+        const_pos_x = self.aaf_file.create.ConstantValue()
+        const_pos_x.parameterdef = paramdef_pos_x
+        const_pos_x.value = x
+
+        y = aaf2.rational.AAFRational(2 * (effect.y - shift_down), int(self._canvas_size.y))
+        const_pos_y = self.aaf_file.create.ConstantValue()
+        const_pos_y.parameterdef = paramdef_pos_y
+        const_pos_y.value = y
+
+        logger.info(f"Shifting to {effect.x - shift_left}, {effect.y - shift_down}")
+        logger.info(f"Shifting floats {float(x)}, {float(y)}")
+
+        # Add ConstantValues to the position operation group
+        op_grp.parameters.append(const_pos_x)
+        op_grp.parameters.append(const_pos_y)
+
+    def _add_rotate_params(self, effect, op_grp):
+        # Create ParameterDefs for rotation
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        paramdef_angle = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_ROTATION, "angle", "angle", typedef
+        )
+        self.aaf_file.dictionary.register_def(paramdef_angle)
+
+        a = Fraction(effect.angle) / 360
+        const_angle = self.aaf_file.create.ConstantValue()
+        const_angle.parameterdef = paramdef_angle
+        const_angle.value = aaf2.rational.AAFRational(a)
+
+        logger.info(f"Rotating by 360 * {a}")
+
+        op_grp.parameters.append(const_angle)
+
+    def _chain_operation(self, op_uuid, op_name, length, next):
+        # Create OperationDefinition
+        op_def = self.aaf_file.create.OperationDef(op_uuid, op_name)
+        op_def.media_kind = self.media_kind
+        op_def["NumberInputs"].value = 1
+        self.aaf_file.dictionary.register_def(op_def)
+
+        # Create OperationGroup
+        op_grp = self.aaf_file.create.OperationGroup(op_def)
+        op_grp.media_kind = self.media_kind
+        op_grp.length = length
+        op_grp.segments.append(next)
+
+        return op_grp
+
+    def aaf_sourceclip(self, otio_clip):
+        source_clip = super().aaf_sourceclip(otio_clip)
+
+        descriptor = otio_clip.media_reference.metadata.get("AAF", {}).get(
+            "EssenceDescription", {})
+
+        reversed_effects = []
+        for e in otio_clip.effects:
+            reversed_effects.insert(0, e)
+
+        width = descriptor["StoredWidth"]
+        height = descriptor["StoredHeight"]
+
+        shift_left = (int(self._canvas_size.x) - width) // 2
+        shift_down = (int(self._canvas_size.y) - height) // 2
+        logger.debug(f'Starting shift: {shift_left}, {shift_down}')
+
+        next = source_clip
+        length = int(otio_clip.duration().value)
+        for e in otio_clip.effects:
+            if isinstance(e, otio.schema.VideoScale):
+                logger.debug(f"Processing VideoScale effect: {e}")
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOSCALE, "Video Scale", length, next)
+                scaled_width, scaled_height = self._add_scale_params(e, next, width, height)
+                shift_left = shift_left + (width - scaled_width) // 2
+                shift_down = shift_down + (height - scaled_height) // 2
+                (width, height) = (scaled_width, scaled_height)
+                logger.debug(f'Post scale shift: {shift_left}, {shift_down}')
+            elif isinstance(e, otio.schema.VideoCrop):
+                logger.debug(f"Processing VideoCrop effect: {e}")
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOCROP, "Video Crop", length, next)
+                width, height, x, y = self._add_crop_params(e, next, width, height)
+                shift_left = shift_left + x
+                shift_down = shift_down + y
+                logger.debug(f'Post crop shift: {shift_left}, {shift_down}')
+            elif isinstance(e, otio.schema.VideoPosition):
+                logger.debug(f"Processing VideoPosition effect: {e}")
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOPOSITION, "Video Position", length, next)
+                self._add_position_params(e, next, shift_left, shift_down)
+                shift_left = shift_down = 0
+            elif isinstance(e, otio.schema.VideoRotate):
+                logger.debug(f"Processing VideoRotation effect: {e}")
+                next = self._chain_operation(AAF_OPERATIONDEF_VIDEOROTATE, "Video Rotate", length, next)
+                self._add_rotate_params(e, next)
+            else:
+                logger.warning(f"Unsupported video effect: {e}")
+
+        return next
 
     def _create_timeline_mobslot(self):
         """
@@ -918,6 +1150,8 @@ class VideoTrackTranscriber(_TrackTranscriber):
         """
         timeline_mobslot = self.compositionmob.create_timeline_slot(
             edit_rate=self.edit_rate)
+        timeline_mobslot.name = self.otio_track.name
+
         sequence = self.aaf_file.create.Sequence(media_kind=self.media_kind)
         sequence.components.value = []
         timeline_mobslot.segment = sequence
@@ -1107,10 +1341,144 @@ class AudioTrackTranscriber(_TrackTranscriber):
             point["ControlPointSource"].value = cp_dict["ControlPointSource"]
             varying_value["PointList"].append(point)
 
-        opgroup = self.timeline_mobslot.segment
-        opgroup.parameters.append(varying_value)
+        self.opgrp_pan.parameters.append(varying_value)
 
-        return super().aaf_sourceclip(otio_clip)
+        return self._process_fades(otio_clip)
+
+    def _process_fades(self, otio_clip):
+        opdef_gain = self.aaf_file.create.OperationDef(AAF_OPERATIONDEF_MONOGAIN, "Audio Gain")
+        opdef_gain.media_kind = self.media_kind
+        opdef_gain["NumberInputs"].value = 1
+        self.aaf_file.dictionary.register_def(opdef_gain)
+
+        opgrp_gain = self.aaf_file.create.OperationGroup(opdef_gain)
+        opgrp_gain.media_kind = self.media_kind
+        opgrp_gain.length = int(otio_clip.duration().value)
+
+        typedef = self.aaf_file.dictionary.lookup_typedef("Rational")
+        param_def = self.aaf_file.create.ParameterDef(AAF_PARAMETERDEF_GAIN,
+                                                      "Gain",
+                                                      "Gain",
+                                                      typedef)
+        self.aaf_file.dictionary.register_def(param_def)
+
+        # Find fades that overlap this clip
+        range = otio_clip.range_in_parent()
+        interval = portion.closedopen(range.start_time.to_seconds(), (range.start_time + range.duration).to_seconds())
+        fades = [f for f in self._fades if interval.overlaps(f["interval"])]
+
+        if not fades:
+            # This clip is not overlapped by any fade
+            # We need to check if there was a previous fade out, however
+            # and if so, set the constant gain to 0.
+            gain = self._gain
+
+            prev = [f for f in self._fades if f["interval"] < interval]
+            if prev:
+                gain = gain * prev[-1]["out"]
+                logger.debug(f"Setting constant gain to {gain} due to prior fade")
+
+            const_gain = self.aaf_file.create.ConstantValue()
+            const_gain.parameterdef = param_def
+            const_gain.value = aaf2.rational.AAFRational(Fraction(gain))
+            opgrp_gain.parameters.append(const_gain)
+            logger.debug(f"Created constant gain: {const_gain.value}")
+        else:
+            interp_def = self.aaf_file.create.InterpolationDef(aaf2.misc.LinearInterp,
+                                                   "LinearInterp",
+                                                   "LinearInterp")
+            self.aaf_file.dictionary.register_def(interp_def)
+
+            varying_gain = self.aaf_file.create.VaryingValue()
+            varying_gain.parameterdef = param_def
+            varying_gain["Interpolation"].value = interp_def
+
+            logger.debug(f'fades: {fades}')
+
+            # Calculate in and out points for each fade, as a proportion of overlapped time
+            prev = None
+            for f in fades:
+                isct = interval.intersection(f["interval"])
+
+                fade_at = lambda x : f["in"] + ((x - f["interval"].lower) * (f["out"] - f["in"])) / (f["interval"].upper - f["interval"].lower)
+
+                start = Fraction(isct.lower) - from_rt(range.start_time) # in clip time
+                end = Fraction(isct.upper) - from_rt(range.start_time)   # in clip time
+
+                if prev != Fraction(self._gain * fade_at(isct.lower)):
+                    pnt_in = self.aaf_file.create.ControlPoint()
+                    pnt_in["Time"].value = aaf2.rational.AAFRational(start / from_rt(otio_clip.duration()))
+                    pnt_in["Value"].value = aaf2.rational.AAFRational(Fraction(self._gain * fade_at(isct.lower)))
+                    pnt_in["ControlPointSource"].value = 2
+                    varying_gain["PointList"].append(pnt_in)
+                    logger.debug(f'gain at {start / from_rt(otio_clip.duration())} == {Fraction(self._gain * fade_at(isct.lower))}')
+
+                pnt_out = self.aaf_file.create.ControlPoint()
+                pnt_out["Time"].value = aaf2.rational.AAFRational(end / from_rt(otio_clip.duration()))
+                pnt_out["Value"].value = aaf2.rational.AAFRational(Fraction(self._gain * fade_at(isct.upper)))
+                pnt_out["ControlPointSource"].value = 2
+                varying_gain["PointList"].append(pnt_out)
+
+                logger.debug(f'gain at {end / from_rt(otio_clip.duration())} == {Fraction(self._gain * fade_at(isct.upper))}')
+
+                prev = Fraction(self._gain * fade_at(isct.upper))
+
+            opgrp_gain.parameters.append(varying_gain)
+
+        opgrp_gain.segments.append(super().aaf_sourceclip(otio_clip))
+
+        return opgrp_gain
+
+    def _parse_track_gain(self):
+        self._gain = 1.0
+        gains = [g for g in self.otio_track.effects if isinstance(g, otio.schema.AudioVolume)]
+        for g in gains:
+            self._gain = self._gain * g.gain
+
+    def _parse_track_fades(self):
+        fades = [f for f in self.otio_track.effects if isinstance(f, otio.schema.AudioFade)]
+        fades.sort(key=lambda f: f.start_time)
+
+        # a fade is an interval (open right), with an in and out gain
+        self._fades = []
+        for f in fades:
+            interval = portion.closedopen(f.start_time, f.start_time + f.duration)
+            val = 0.0 if f.fade_in else 1.0
+
+            if not self._fades:
+                # Special case first entry
+                if f.start_time != 0:
+                    # make a flat zone
+                    self._fades.append({
+                        "interval" : portion.closedopen(0.0, f.start_time),
+                        "in" : val,
+                        "out" : val
+                    })
+                else:
+                    self._fades.append({
+                        "interval" : interval,
+                        "in" : val,
+                        "out" : 1.0 - val
+                    })
+                    continue
+
+            prev = self._fades[-1]
+            if not prev["interval"].adjacent(interval):
+                # Make a flat zone
+                if prev["out"] != val:
+                    raise RuntimeError(f"Two fades of same type in sequence {prev} : {f}")
+
+                self._fades.append({
+                    "interval" : portion.closedopen(prev["interval"].upper, interval.lower),
+                    "in" : val,
+                    "out" : val
+                })
+
+            self._fades.append({
+                "interval" : interval,
+                "in" : val,
+                "out" : 1.0 - val
+            })
 
     def _create_timeline_mobslot(self):
         """
@@ -1119,6 +1487,9 @@ class AudioTrackTranscriber(_TrackTranscriber):
 
         TimelineMobSlot --> OperationGroup --> Sequence
         """
+        self._parse_track_gain()
+        self._parse_track_fades()
+
         # TimelineMobSlot
         timeline_mobslot = self.compositionmob.create_sound_slot(
             edit_rate=self.edit_rate)
@@ -1130,15 +1501,16 @@ class AudioTrackTranscriber(_TrackTranscriber):
         self.aaf_file.dictionary.register_def(opdef)
         # OperationGroup
         total_length = int(sum([t.duration().value for t in self.otio_track]))
-        opgroup = self.aaf_file.create.OperationGroup(opdef)
-        opgroup.media_kind = self.media_kind
-        opgroup.length = total_length
-        timeline_mobslot.segment = opgroup
+        self.opgrp_pan = self.aaf_file.create.OperationGroup(opdef)
+        self.opgrp_pan.media_kind = self.media_kind
+        self.opgrp_pan.length = total_length
+        timeline_mobslot.segment = self.opgrp_pan
+
         # Sequence
         sequence = self.aaf_file.create.Sequence(media_kind=self.media_kind)
         sequence.components.value = []
         sequence.length = total_length
-        opgroup.segments.append(sequence)
+        self.opgrp_pan.segments.append(sequence)
         return timeline_mobslot, sequence
 
     def default_descriptor(self, otio_clip):

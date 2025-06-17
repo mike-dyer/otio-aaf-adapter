@@ -30,6 +30,7 @@ This adapter was originally included with OpenTimelineIO as a contrib adapter. I
 
 * [OpenTimelineIO](https://github.com/AcademySoftwareFoundation/OpenTimelineIO)
 * [pyaaf2](https://github.com/markreidvfx/pyaaf2)
+* [portion](https://github.com/AlexandreDecan/portion)
 
 
 ## Licensing
