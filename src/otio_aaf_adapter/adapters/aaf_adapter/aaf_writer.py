@@ -151,6 +151,36 @@ class AAFFileTranscriber:
         self._transcribe_user_comments(input_otio, self.compositionmob)
         self._transcribe_mob_attributes(input_otio, self.compositionmob)
 
+        self._transcribe_stack_markers(input_otio.tracks, input_otio.duration().rate)
+
+
+    def _transcribe_stack_markers(self, tracks, editrate):
+        """
+        Transcribe markers from the stack.
+        """
+        if isinstance(tracks, otio.schema.Stack):
+            slot = self.aaf_file.create.EventMobSlot()
+            slot.edit_rate = editrate
+            slot.slot_id= 30
+            slot.name = tracks.name
+
+            sequence = self.aaf_file.create.Sequence("DescriptiveMetadata")
+            sequence.components.value = []
+            slot.segment = sequence
+
+            for m in tracks.markers:
+                start = int(m.marked_range.start_time.to_seconds() * editrate)
+                duration = int(m.marked_range.duration.to_seconds() * editrate)
+
+                marker = self.aaf_file.create.DescriptiveMarker()
+                marker['Comment'].value = m.comment
+                marker['Position'].value = start
+                marker['Length'].value = duration
+
+                sequence.components.append(marker)
+
+            self.compositionmob.slots.append(slot)
+
     def _unique_mastermob(self, otio_clip):
         """Get a unique mastermob, identified by clip metadata mob id."""
         mob_id = self._clip_mob_ids_map.get(otio_clip)
