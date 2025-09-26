@@ -293,6 +293,15 @@ def validate_metadata(timeline):
     all_checks = [__check(timeline, "duration().rate")]
     edit_rate = __check(timeline, "duration().rate").value
 
+    # rescale available range to edit rate
+    for clips in timeline.find_clips():
+        if clips.media_reference.available_range:
+            new_range = otio.opentime.TimeRange(
+                start_time=clips.media_reference.available_range.start_time.rescaled_to(edit_rate),
+                duration=clips.media_reference.available_range.duration.rescaled_to(edit_rate)
+            )
+            clips.media_reference.available_range = new_range
+
     for child in timeline.find_children():
         checks = []
         if _is_considered_gap(child):
