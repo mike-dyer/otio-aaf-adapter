@@ -2217,6 +2217,183 @@ class AAFWriterTests(unittest.TestCase):
             self.assertEqual(source_mob.descriptor['Length'].value, 100)
             self.assertEqual(source_mob.descriptor['SampleRate'].value, 48)
 
+    def test_aaf_writer_samplerate_priority(self):
+        """Tests that EssenceDescription SampleRate takes priority over available_range.duration.rate"""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+        range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),
+            duration=otio.opentime.RationalTime(100, 24),
+        )
+        clip = otio.schema.Clip(source_range=range)
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/picchu_seq0100_snippet_dnx.mov",
+            available_range=range
+        )
+        tl.tracks.append(otio.schema.Track())
+        tl.tracks[0].append(clip)
+
+        # Set EssenceDescription SampleRate different from available_range rate
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=13)),
+            "EssenceDescription": {
+                "SampleRate": 23.976,
+                "StoredWidth": 1920,
+                "StoredHeight": 1080
+            }
+        }
+
+        # write to temp AAF file
+        _, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(tl, tmp_aaf_path)
+
+        # check that EssenceDescription SampleRate is used, not available_range.rate
+        # and that Length is recalculated based on the new SampleRate
+        with aaf2.open(tmp_aaf_path) as aaf_file:
+            source_mob = list(aaf_file.content.sourcemobs())[1]
+            self.assertAlmostEqual(float(source_mob.descriptor['SampleRate'].value), 23.976, places=3)
+
+            # Length calculation: 100 frames @ 24fps → 23.976fps
+            # = 100 * (23.976/24) ≈ 99.9 → 99 frames
+            length = source_mob.descriptor['Length'].value
+            self.assertEqual(length, 99)
+
+    def test_aaf_writer_length_calculation_with_samplerate(self):
+        """Tests that Length is calculated correctly when EssenceDescription SampleRate is provided"""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+        # 100 frames at 24fps = 4.1667 seconds
+        range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),
+            duration=otio.opentime.RationalTime(100, 24),
+        )
+        clip = otio.schema.Clip(source_range=range)
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/picchu_seq0100_snippet_dnx.mov",
+            available_range=range
+        )
+        tl.tracks.append(otio.schema.Track())
+        tl.tracks[0].append(clip)
+
+        # Set custom SampleRate - should calculate new Length based on this rate
+        # 4.1667 seconds * 23.976 fps ≈ 99.9 frames → 99 frames
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=13)),
+            "EssenceDescription": {
+                "SampleRate": 23.976,
+                "StoredWidth": 1920,
+                "StoredHeight": 1080
+            }
+        }
+
+        # write to temp AAF file
+        _, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(tl, tmp_aaf_path)
+
+        # check calculated Length
+        with aaf2.open(tmp_aaf_path) as aaf_file:
+            source_mob = list(aaf_file.content.sourcemobs())[1]
+            # 100 frames @ 24fps rescaled to 23.976fps should be 99 frames
+            self.assertEqual(source_mob.descriptor['Length'].value, 99)
+
+    def test_aaf_writer_fractional_samplerate(self):
+        """Tests that fractional SampleRate (24000/1001) works correctly"""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+        range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 30000/1001),  # 29.97fps
+            duration=otio.opentime.RationalTime(100, 30000/1001),
+        )
+        clip = otio.schema.Clip(source_range=range)
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/picchu_seq0100_snippet_dnx.mov",
+            available_range=range
+        )
+        tl.tracks.append(otio.schema.Track())
+        tl.tracks[0].append(clip)
+
+        # Set fractional SampleRate as "24000/1001" (23.976fps) using string
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=13)),
+            "EssenceDescription": {
+                "SampleRate": "24000/1001",  # Use string for exact rational
+                "StoredWidth": 1920,
+                "StoredHeight": 1080
+            }
+        }
+
+        # write to temp AAF file
+        _, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(tl, tmp_aaf_path)
+
+        # check that fractional rate is preserved and Length is calculated correctly
+        with aaf2.open(tmp_aaf_path) as aaf_file:
+            source_mob = list(aaf_file.content.sourcemobs())[1]
+            rate = float(source_mob.descriptor['SampleRate'].value)
+            self.assertAlmostEqual(rate, 24000/1001, places=6)
+
+            # Length calculation: 100 frames @ 29.97fps → 23.976fps
+            # = 100 * (23.976/29.97) ≈ 80.0 → 80 frames
+            length = source_mob.descriptor['Length'].value
+            self.assertEqual(length, 80)
+
+    def test_aaf_writer_rational_string_samplerate(self):
+        """Tests that rational string SampleRate formats work correctly"""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+        range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),
+            duration=otio.opentime.RationalTime(100, 24),
+        )
+        clip = otio.schema.Clip(source_range=range)
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/picchu_seq0100_snippet_dnx.mov",
+            available_range=range
+        )
+        tl.tracks.append(otio.schema.Track())
+        tl.tracks[0].append(clip)
+
+        # Test rational string format "24000/1001"
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=13)),
+            "EssenceDescription": {
+                "SampleRate": "24000/1001",  # String format
+                "StoredWidth": 1920,
+                "StoredHeight": 1080
+            }
+        }
+
+        # write to temp AAF file
+        _, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(tl, tmp_aaf_path)
+
+        # check that string rational is parsed correctly and Length is calculated
+        with aaf2.open(tmp_aaf_path) as aaf_file:
+            source_mob = list(aaf_file.content.sourcemobs())[1]
+            rate = float(source_mob.descriptor['SampleRate'].value)
+            self.assertAlmostEqual(rate, 24000/1001, places=6)
+
+            # Length calculation: 100 frames @ 24fps → 23.976fps
+            # = 100 * (23.976/24) ≈ 99.9 → 99 frames
+            length = source_mob.descriptor['Length'].value
+            self.assertEqual(length, 99)
+
+        # Test simple integer string
+        clip.media_reference.metadata["AAF"]["EssenceDescription"]["SampleRate"] = "25"
+
+        _, tmp_aaf_path2 = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(tl, tmp_aaf_path2)
+
+        with aaf2.open(tmp_aaf_path2) as aaf_file:
+            source_mob = list(aaf_file.content.sourcemobs())[1]
+            rate = float(source_mob.descriptor['SampleRate'].value)
+            self.assertEqual(rate, 25.0)
+
+            # Length calculation: 100 frames @ 24fps → 25fps
+            # = 100 * (25/24) ≈ 104.17 → 104 frames
+            length = source_mob.descriptor['Length'].value
+            self.assertEqual(length, 104)
+
     def test_aaf_writer_cdci_descriptor(self):
         """Tests that CDCI descriptor is properly transcribed"""
         tl = otio.schema.Timeline()

@@ -293,14 +293,28 @@ def validate_metadata(timeline):
     all_checks = [__check(timeline, "duration().rate")]
     edit_rate = __check(timeline, "duration().rate").value
 
-    # rescale available range to edit rate
+    # rescale available range to media sample rate
     for clips in timeline.find_clips():
+        # Get the media's SampleRate, fallback to timeline edit_rate
+        media_sample_rate = clips.media_reference.metadata.get("AAF", {}).get("EssenceDescription", {}).get("SampleRate", edit_rate)
+
+        # Convert string rationals to float for rescaled_to()
+        if isinstance(media_sample_rate, str):
+            media_sample_rate = float(aaf2.rational.AAFRational(media_sample_rate))
+
         if clips.media_reference.available_range:
             new_range = otio.opentime.TimeRange(
-                start_time=clips.media_reference.available_range.start_time.rescaled_to(edit_rate),
-                duration=clips.media_reference.available_range.duration.rescaled_to(edit_rate)
+                start_time=clips.media_reference.available_range.start_time.rescaled_to(media_sample_rate),
+                duration=clips.media_reference.available_range.duration.rescaled_to(media_sample_rate)
             )
             clips.media_reference.available_range = new_range
+
+        if hasattr(clips, "source_range") and clips.source_range is not None:
+            new_range = otio.opentime.TimeRange(
+                start_time=clips.source_range.start_time.rescaled_to(media_sample_rate),
+                duration=clips.source_range.duration.rescaled_to(media_sample_rate)
+            )
+            clips.source_range = new_range
 
     for child in timeline.find_children():
         checks = []
@@ -309,12 +323,19 @@ def validate_metadata(timeline):
                 __check(child, "duration().rate").equals(edit_rate)
             ]
         if isinstance(child, otio.schema.Clip):
+            # Get the expected media sample rate for this clip
+            expected_media_rate = child.media_reference.metadata.get("AAF", {}).get("EssenceDescription", {}).get("SampleRate", edit_rate)
+
+            # Convert string rationals to float for validation checks
+            if isinstance(expected_media_rate, str):
+                expected_media_rate = float(aaf2.rational.AAFRational(expected_media_rate))
+
             checks = [
-                __check(child, "duration().rate").equals(edit_rate),
+                __check(child, "duration().rate").equals(expected_media_rate),
                 __check(child, "media_reference.available_range.duration.rate"
-                        ).equals(edit_rate),
+                        ).equals(expected_media_rate),
                 __check(child, "media_reference.available_range.start_time.rate"
-                        ).equals(edit_rate)
+                        ).equals(expected_media_rate)
             ]
         if isinstance(child, otio.schema.Transition):
             checks = [
@@ -1112,8 +1133,8 @@ class VideoTrackTranscriber(_TrackTranscriber):
         for e in otio_clip.effects:
             reversed_effects.insert(0, e)
 
-        width = descriptor["StoredWidth"]
-        height = descriptor["StoredHeight"]
+        width = descriptor.get("StoredWidth", 1920)
+        height = descriptor.get("StoredHeight", 1080)
 
         shift_left = (int(self._canvas_size.x) - width) // 2
         shift_down = (int(self._canvas_size.y) - height) // 2
@@ -1217,8 +1238,8 @@ class VideoTrackTranscriber(_TrackTranscriber):
 
         # aaf2 Rational follows python's fractions logic,
         # thus able to construct from anything
-        descriptor["SampleRate"].value = str(aaf2.rational.AAFRational(
-            descriptor_dict.get("SampleRate", 24)))
+        descriptor["SampleRate"].value = aaf2.rational.AAFRational(
+            descriptor_dict.get("SampleRate", 24))
         descriptor["Length"].value = int(descriptor_dict.get("Length", 1))
 
         media = otio_clip.media_reference
@@ -1227,8 +1248,16 @@ class VideoTrackTranscriber(_TrackTranscriber):
                 locator = self.aaf_network_locator(media)
                 descriptor["Locator"].append(locator)
             if media.available_range:
-                descriptor['SampleRate'].value = media.available_range.duration.rate
-                descriptor["Length"].value = int(media.available_range.duration.value)
+                if "SampleRate" in descriptor_dict:
+                    # EssenceDescription SampleRate takes priority, calculate Length using it
+                    # Rescale duration to the new sample rate
+                    sample_rate = descriptor["SampleRate"].value
+                    length_frames = media.available_range.duration.rescaled_to(sample_rate).value
+                    descriptor["Length"].value = int(length_frames)
+                else:
+                    # No EssenceDescription SampleRate, use available_range values
+                    descriptor['SampleRate'].value = media.available_range.duration.rate
+                    descriptor["Length"].value = int(media.available_range.duration.value)
 
         # Finalize the descriptor with the rest of the properties
         descriptor = self.transcribe_otio_aaf_descriptor(descriptor, descriptor_dict)
