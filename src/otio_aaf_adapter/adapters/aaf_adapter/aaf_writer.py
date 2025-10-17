@@ -1387,9 +1387,11 @@ class AudioTrackTranscriber(_TrackTranscriber):
                 gain = gain * prev[-1]["out"]
                 logger.debug(f"Setting constant gain to {gain} due to prior fade")
 
+            # Limit fraction denominator to avoid 32-bit integer overflow
+            gain_fraction = Fraction(gain).limit_denominator(1000)
             const_gain = self.aaf_file.create.ConstantValue()
             const_gain.parameterdef = param_def
-            const_gain.value = aaf2.rational.AAFRational(Fraction(gain))
+            const_gain.value = aaf2.rational.AAFRational(gain_fraction)
             opgrp_gain.parameters.append(const_gain)
             logger.debug(f"Created constant gain: {const_gain.value}")
         else:
@@ -1414,23 +1416,27 @@ class AudioTrackTranscriber(_TrackTranscriber):
                 start = Fraction(isct.lower) - from_rt(range.start_time) # in clip time
                 end = Fraction(isct.upper) - from_rt(range.start_time)   # in clip time
 
-                if prev != Fraction(self._gain * fade_at(isct.lower)):
+                gain_val = self._gain * fade_at(isct.lower)
+                gain_frac = Fraction(gain_val).limit_denominator(1000)
+                if prev != gain_frac:
                     pnt_in = self.aaf_file.create.ControlPoint()
                     pnt_in["Time"].value = aaf2.rational.AAFRational(start / from_rt(otio_clip.duration()))
-                    pnt_in["Value"].value = aaf2.rational.AAFRational(Fraction(self._gain * fade_at(isct.lower)))
+                    pnt_in["Value"].value = aaf2.rational.AAFRational(gain_frac)
                     pnt_in["ControlPointSource"].value = 2
                     varying_gain["PointList"].append(pnt_in)
-                    logger.debug(f'gain at {start / from_rt(otio_clip.duration())} == {Fraction(self._gain * fade_at(isct.lower))}')
+                    logger.debug(f'gain at {start / from_rt(otio_clip.duration())} == {gain_frac}')
 
                 pnt_out = self.aaf_file.create.ControlPoint()
                 pnt_out["Time"].value = aaf2.rational.AAFRational(end / from_rt(otio_clip.duration()))
-                pnt_out["Value"].value = aaf2.rational.AAFRational(Fraction(self._gain * fade_at(isct.upper)))
+                gain_out_val = self._gain * fade_at(isct.upper)
+                gain_out_frac = Fraction(gain_out_val).limit_denominator(1000)
+                pnt_out["Value"].value = aaf2.rational.AAFRational(gain_out_frac)
                 pnt_out["ControlPointSource"].value = 2
                 varying_gain["PointList"].append(pnt_out)
 
-                logger.debug(f'gain at {end / from_rt(otio_clip.duration())} == {Fraction(self._gain * fade_at(isct.upper))}')
+                logger.debug(f'gain at {end / from_rt(otio_clip.duration())} == {gain_out_frac}')
 
-                prev = Fraction(self._gain * fade_at(isct.upper))
+                prev = gain_out_frac
 
             opgrp_gain.parameters.append(varying_gain)
 
