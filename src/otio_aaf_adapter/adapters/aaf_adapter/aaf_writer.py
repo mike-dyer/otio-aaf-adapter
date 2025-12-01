@@ -293,42 +293,42 @@ def validate_metadata(timeline):
     all_checks = [__check(timeline, "duration().rate")]
     edit_rate = __check(timeline, "duration().rate").value
 
-    # rescale available range to media sample rate
-    for clips in timeline.find_clips():
-        # Get the media's SampleRate, fallback to timeline edit_rate
-        media_sample_rate = clips.media_reference.metadata.get("AAF", {}).get("EssenceDescription", {}).get("SampleRate", edit_rate)
-
-        # Convert string rationals to float for rescaled_to()
-        if isinstance(media_sample_rate, str):
-            media_sample_rate = float(aaf2.rational.AAFRational(media_sample_rate))
-
-        if clips.media_reference.available_range:
-            new_range = otio.opentime.TimeRange(
-                start_time=clips.media_reference.available_range.start_time.rescaled_to(media_sample_rate),
-                duration=clips.media_reference.available_range.duration.rescaled_to(media_sample_rate)
-            )
-            clips.media_reference.available_range = new_range
-
-        if hasattr(clips, "source_range") and clips.source_range is not None:
-            new_range = otio.opentime.TimeRange(
-                start_time=clips.source_range.start_time.rescaled_to(media_sample_rate),
-                duration=clips.source_range.duration.rescaled_to(media_sample_rate)
-            )
-            clips.source_range = new_range
-
     for child in timeline.find_children():
         checks = []
         if _is_considered_gap(child):
+            # Determine expected rate based on track type
+            parent_track = child.parent()
+            if (hasattr(parent_track, 'kind') and
+                parent_track.kind == otio.schema.TrackKind.Audio):
+                # Audio gaps should use media sample rate
+                # Find a clip in the same track to get the sample rate
+                audio_clips = [c for c in parent_track if isinstance(c, otio.schema.Clip)]
+                if audio_clips:
+                    first_clip = audio_clips[0]
+                    expected_gap_rate = first_clip.media_reference.metadata.get("AAF", {}).get("EssenceDescription", {}).get("SampleRate", edit_rate)
+                    if isinstance(expected_gap_rate, str):
+                        expected_gap_rate = float(aaf2.rational.AAFRational(expected_gap_rate))
+                else:
+                    expected_gap_rate = edit_rate
+            else:
+                # Video gaps use timeline edit rate
+                expected_gap_rate = edit_rate
+
             checks = [
-                __check(child, "duration().rate").equals(edit_rate)
+                __check(child, "duration().rate").equals(expected_gap_rate)
             ]
         if isinstance(child, otio.schema.Clip):
-            # Get the expected media sample rate for this clip
-            expected_media_rate = child.media_reference.metadata.get("AAF", {}).get("EssenceDescription", {}).get("SampleRate", edit_rate)
-
-            # Convert string rationals to float for validation checks
-            if isinstance(expected_media_rate, str):
-                expected_media_rate = float(aaf2.rational.AAFRational(expected_media_rate))
+            # Determine expected rate based on track type
+            parent_track = child.parent()
+            if (hasattr(parent_track, 'kind') and
+                parent_track.kind == otio.schema.TrackKind.Audio):
+                # Audio clips should have all rates normalized to media sample rate
+                expected_media_rate = child.media_reference.metadata.get("AAF", {}).get("EssenceDescription", {}).get("SampleRate", 48000)
+                if isinstance(expected_media_rate, str):
+                    expected_media_rate = float(aaf2.rational.AAFRational(expected_media_rate))
+            else:
+                # Video clips use timeline edit rate
+                expected_media_rate = edit_rate
 
             checks = [
                 __check(child, "duration().rate").equals(expected_media_rate),
@@ -337,6 +337,13 @@ def validate_metadata(timeline):
                 __check(child, "media_reference.available_range.start_time.rate"
                         ).equals(expected_media_rate)
             ]
+
+            # Also validate source_range if it exists
+            if hasattr(child, "source_range") and child.source_range is not None:
+                checks.extend([
+                    __check(child, "source_range.duration.rate").equals(expected_media_rate),
+                    __check(child, "source_range.start_time.rate").equals(expected_media_rate)
+                ])
         if isinstance(child, otio.schema.Transition):
             checks = [
                 __check(child, "duration().rate").equals(edit_rate),
@@ -615,7 +622,8 @@ class _TrackTranscriber:
 
     def aaf_filler(self, otio_gap):
         """Convert an otio Gap into an aaf Filler"""
-        length = int(otio_gap.visible_range().duration.value)
+        # Convert gap duration from timeline rate to track edit rate
+        length = int(otio_gap.visible_range().duration.rescaled_to(self.edit_rate).value)
         filler = self.aaf_file.create.Filler(self.media_kind, length)
         return filler
 
@@ -1327,6 +1335,24 @@ class VideoTrackTranscriber(_TrackTranscriber):
 
 class AudioTrackTranscriber(_TrackTranscriber):
     """Audio track kind specialization of TrackTranscriber."""
+
+    def __init__(self, root_file_transcriber, otio_track, embed_essence, create_edgecode):
+        """Initialize AudioTrackTranscriber with correct audio sample rate."""
+        # Call parent init first
+        super().__init__(root_file_transcriber, otio_track, embed_essence, create_edgecode)
+
+        # Override edit_rate with audio sample rate from media metadata
+        # Find the first audio clip to get the sample rate
+        audio_clips = [c for c in otio_track if isinstance(c, otio.schema.Clip)]
+        if audio_clips:
+            first_clip = audio_clips[0]
+            if (first_clip.media_reference and
+                hasattr(first_clip.media_reference, 'metadata')):
+                aaf_meta = first_clip.media_reference.metadata.get("AAF", {})
+                essence_desc = aaf_meta.get("EssenceDescription", {})
+                if "SampleRate" in essence_desc:
+                    # Use the media sample rate instead of timeline rate
+                    self.edit_rate = float(essence_desc["SampleRate"])
 
     @property
     def media_kind(self):
