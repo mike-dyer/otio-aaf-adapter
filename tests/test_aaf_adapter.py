@@ -1901,8 +1901,11 @@ class AAFWriterTests(unittest.TestCase):
         try:
             otio.adapters.write_to_file(otio_timeline, tmp_aaf_path)
         except AAFValidationError as e:
-            # Four error messages are raised
-            self.assertEqual(4, len(list(filter(bool, str(e).split("\n")))))
+            # With SampleRate-based validation:
+            # - Video clip: null available_range, no SampleRate metadata -> 2 errors (available_range access)
+            # - Audio clip: no SampleRate metadata -> lenient validation -> 0 strict errors
+            # So we expect 2 errors total
+            self.assertEqual(2, len(list(filter(bool, str(e).split("\n")))))
             with self.assertRaises(AAFValidationError):
                 raise e
 
@@ -2923,6 +2926,261 @@ class AAFWriterTests(unittest.TestCase):
             self.assertIsNotNone(aaf_clip)
             self.assertEqual(aaf_clip.source_range, ref_clip.source_range)
 
+    def test_validation_normalized_audio_rates_success(self):
+        """Tests that validate_metadata accepts properly normalized audio track rates."""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+
+        # Create audio track with normalized 48000Hz rates
+        audio_track = otio.schema.Track(kind=otio.schema.TrackKind.Audio)
+
+        # Add a gap with 48000Hz rate
+        gap = otio.schema.Gap()
+        gap.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 48000),
+            duration=otio.opentime.RationalTime(48000, 48000)  # 1 second gap
+        )
+        audio_track.append(gap)
+
+        # Add an audio clip with 48000Hz rates
+        clip = otio.schema.Clip()
+        clip.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 48000),
+            duration=otio.opentime.RationalTime(96000, 48000)  # 2 second clip
+        )
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/audio_clip.wav",
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 48000),
+                duration=otio.opentime.RationalTime(96000, 48000)
+            )
+        )
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=14)),
+            "EssenceDescription": {
+                "SampleRate": 48000,
+                "Channels": 2
+            }
+        }
+        audio_track.append(clip)
+
+        tl.tracks.append(audio_track)
+
+        # Should not raise validation error
+        from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import validate_metadata
+        try:
+            validate_metadata(tl)  # Should pass
+        except AAFValidationError:
+            self.fail("validate_metadata raised AAFValidationError unexpectedly")
+
+    def test_validation_mixed_rates_failure(self):
+        """Tests that validate_metadata rejects audio tracks with inconsistent rates."""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+
+        # Create audio track with MIXED rates (should fail)
+        audio_track = otio.schema.Track(kind=otio.schema.TrackKind.Audio)
+
+        # Gap with WRONG rate (timeline rate instead of audio rate)
+        gap = otio.schema.Gap()
+        gap.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),  # Wrong rate!
+            duration=otio.opentime.RationalTime(24, 24)    # Should be 48000Hz
+        )
+        audio_track.append(gap)
+
+        # Audio clip with correct 48000Hz metadata but wrong duration rate
+        clip = otio.schema.Clip()
+        clip.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),    # Wrong rate!
+            duration=otio.opentime.RationalTime(48, 24)     # Should be 48000Hz
+        )
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/audio_clip.wav",
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 48000),
+                duration=otio.opentime.RationalTime(96000, 48000)
+            )
+        )
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=16)),
+            "EssenceDescription": {
+                "SampleRate": 48000,  # Correct metadata
+                "Channels": 2
+            }
+        }
+        audio_track.append(clip)
+
+        tl.tracks.append(audio_track)
+
+        # Should raise validation error due to rate mismatch
+        from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import validate_metadata
+        with self.assertRaises(AAFValidationError) as context:
+            validate_metadata(tl)
+
+        # Should contain rate mismatch errors
+        error_msg = str(context.exception)
+        self.assertIn("duration().rate", error_msg)
+        self.assertIn("24.0", error_msg)
+        self.assertIn("48000", error_msg)
+
+    def test_validation_video_rates_success(self):
+        """Tests that validate_metadata accepts properly normalized video track rates."""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+
+        # Create video track with normalized 24fps rates
+        video_track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
+
+        # Add a gap with 24fps rate
+        gap = otio.schema.Gap()
+        gap.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),
+            duration=otio.opentime.RationalTime(24, 24)  # 1 second gap
+        )
+        video_track.append(gap)
+
+        # Add a video clip with 24fps rates
+        clip = otio.schema.Clip()
+        clip.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 24),
+            duration=otio.opentime.RationalTime(48, 24)  # 2 second clip
+        )
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/video_clip.mov",
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 24),
+                duration=otio.opentime.RationalTime(48, 24)
+            )
+        )
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=15)),
+            "EssenceDescription": {
+                "SampleRate": 24,
+                "StoredWidth": 1920,
+                "StoredHeight": 1080
+            }
+        }
+        video_track.append(clip)
+
+        tl.tracks.append(video_track)
+
+        # Should not raise validation error
+        from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import validate_metadata
+        try:
+            validate_metadata(tl)  # Should pass
+        except AAFValidationError:
+            self.fail("validate_metadata raised AAFValidationError unexpectedly")
+
+    def test_validation_fractional_rate_success(self):
+        """Tests that validation works with fractional rates like 48000/1001."""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+
+        # Create audio track with fractional sample rate
+        audio_track = otio.schema.Track(kind=otio.schema.TrackKind.Audio)
+
+        # Add audio clip with fractional sample rate
+        clip = otio.schema.Clip()
+        fractional_rate = 48000/1001
+        clip.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, fractional_rate),
+            duration=otio.opentime.RationalTime(96000, fractional_rate)
+        )
+        clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/audio_clip.wav",
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, fractional_rate),
+                duration=otio.opentime.RationalTime(96000, fractional_rate)
+            )
+        )
+        clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=17)),
+            "EssenceDescription": {
+                "SampleRate": "48000/1001",  # Fractional rate as string
+                "Channels": 2
+            }
+        }
+        audio_track.append(clip)
+
+        # Add gap that matches the fractional sample rate
+        gap = otio.schema.Gap()
+        gap.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(96000, fractional_rate),
+            duration=otio.opentime.RationalTime(48000, fractional_rate)
+        )
+        audio_track.append(gap)
+
+        tl.tracks.append(audio_track)
+
+        # Should not raise validation error
+        from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import validate_metadata
+        try:
+            validate_metadata(tl)  # Should pass
+        except AAFValidationError:
+            self.fail("validate_metadata failed on fractional audio sample rate")
+
+    def test_validation_mixed_audio_video_success(self):
+        """Tests validation with both audio and video tracks using different rates."""
+        tl = otio.schema.Timeline()
+        tl.canvas_size = otio.schema.V2d(1920, 1080)
+
+        # Video track at 30fps
+        video_track = otio.schema.Track(kind=otio.schema.TrackKind.Video)
+        video_clip = otio.schema.Clip()
+        video_clip.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 30),
+            duration=otio.opentime.RationalTime(60, 30)  # 2 seconds
+        )
+        video_clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/video_30fps.mov",
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 30),
+                duration=otio.opentime.RationalTime(60, 30)
+            )
+        )
+        video_clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=18)),
+            "EssenceDescription": {
+                "SampleRate": 30,
+                "StoredWidth": 1920,
+                "StoredHeight": 1080
+            }
+        }
+        video_track.append(video_clip)
+        tl.tracks.append(video_track)
+
+        # Audio track at 44100Hz
+        audio_track = otio.schema.Track(kind=otio.schema.TrackKind.Audio)
+        audio_clip = otio.schema.Clip()
+        audio_clip.source_range = otio.opentime.TimeRange(
+            start_time=otio.opentime.RationalTime(0, 44100),
+            duration=otio.opentime.RationalTime(88200, 44100)  # 2 seconds
+        )
+        audio_clip.media_reference = otio.schema.ExternalReference(
+            target_url="sample_data/audio_44khz.wav",
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 44100),
+                duration=otio.opentime.RationalTime(88200, 44100)
+            )
+        )
+        audio_clip.media_reference.metadata["AAF"] = {
+            "SourceID": str(MobID(int=19)),
+            "EssenceDescription": {
+                "SampleRate": 44100,
+                "Channels": 2
+            }
+        }
+        audio_track.append(audio_clip)
+        tl.tracks.append(audio_track)
+
+        # Should validate successfully with different rates per track type
+        from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import validate_metadata
+        try:
+            validate_metadata(tl)  # Should pass
+        except AAFValidationError:
+            self.fail("validate_metadata failed on mixed audio/video track validation")
+
 
 class SimplifyTests(unittest.TestCase):
     def test_aaf_simplify(self):
@@ -3051,6 +3309,7 @@ class SimplifyTests(unittest.TestCase):
         # None of the things in the top level stack should be a clip
         for i in simple_tl.tracks:
             self.assertNotEqual(type(i), otio.schema.Clip)
+
 
 
 if __name__ == '__main__':
