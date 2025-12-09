@@ -147,9 +147,29 @@ class AAFFileTranscriber:
         self._canvas_size = input_otio.canvas_size
         logger.debug(f'canvas: {self._canvas_size}')
 
+        # Calculate max source dimensions from all video clips
+        self._max_source_size = self._calculate_max_source_size(input_otio)
+        logger.debug(f'max_source_size: {self._max_source_size}')
+
         # transcribe timeline comments onto composition mob
         self._transcribe_user_comments(input_otio, self.compositionmob)
         self._transcribe_mob_attributes(input_otio, self.compositionmob)
+
+    def _calculate_max_source_size(self, input_otio):
+        """Find the maximum source dimensions across all video clips."""
+        max_width = 0
+        max_height = 0
+        for track in input_otio.video_tracks():
+            for clip in track.find_clips():
+                if clip.media_reference:
+                    descriptor = clip.media_reference.metadata.get("AAF", {}).get(
+                        "EssenceDescription", {})
+                    width = descriptor.get("StoredWidth", 0)
+                    height = descriptor.get("StoredHeight", 0)
+                    max_width = max(max_width, width)
+                    max_height = max(max_height, height)
+        # Default to 1920x1080 if no dimensions found
+        return (max_width or 1920, max_height or 1080)
 
     def _unique_mastermob(self, otio_clip):
         """Get a unique mastermob, identified by clip metadata mob id."""
@@ -222,7 +242,8 @@ class AAFFileTranscriber:
             transcriber = VideoTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
                                                 create_edgecode=self.create_edgecode,
-                                                canvas_size=self._canvas_size)
+                                                canvas_size=self._canvas_size,
+                                                max_source_size=self._max_source_size)
         elif otio_track.kind == otio.schema.TrackKind.Audio:
             transcriber = AudioTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
@@ -1005,8 +1026,9 @@ class _TrackTranscriber:
 class VideoTrackTranscriber(_TrackTranscriber):
     """Video track kind specialization of TrackTranscriber."""
     def __init__(self, root_file_transcriber, otio_track,
-                 embed_essence, create_edgecode, canvas_size):
+                 embed_essence, create_edgecode, canvas_size, max_source_size):
         self._canvas_size = canvas_size
+        self._max_source_size = max_source_size
         super().__init__(root_file_transcriber, otio_track,
                          embed_essence, create_edgecode)
     @property
@@ -1103,7 +1125,7 @@ class VideoTrackTranscriber(_TrackTranscriber):
 
         return (width - effect.left - effect.right), (height - effect.top - effect.bottom), effect.left, effect.top
 
-    def _add_position_params(self, effect, op_grp, shift_left, shift_down):
+    def _add_position_params(self, effect, op_grp, shift_left, shift_down, source_width, source_height, max_source_width, max_source_height):
         """ Add position parameters """
 
         # Create ParameterDefs for position X and Y
@@ -1118,17 +1140,27 @@ class VideoTrackTranscriber(_TrackTranscriber):
         self.aaf_file.dictionary.register_def(paramdef_pos_y)
 
         # Create ConstantValues for position X and Y
-        x = aaf2.rational.AAFRational(2 * (effect.x - shift_left), int(self._canvas_size.x))
+        # Premiere assumes canvas = largest source. For smaller sources,
+        # we need to scale position by (max_source / this_source) ratio.
+        # Use integer math to avoid float issues with AAFRational
+        x = aaf2.rational.AAFRational(
+            2 * (effect.x - shift_left) * max_source_width,
+            int(self._canvas_size.x) * source_width
+        )
         const_pos_x = self.aaf_file.create.ConstantValue()
         const_pos_x.parameterdef = paramdef_pos_x
         const_pos_x.value = x
 
-        y = aaf2.rational.AAFRational(2 * (effect.y - shift_down), int(self._canvas_size.y))
+        y = aaf2.rational.AAFRational(
+            2 * (effect.y - shift_down) * max_source_height,
+            int(self._canvas_size.y) * source_height
+        )
         const_pos_y = self.aaf_file.create.ConstantValue()
         const_pos_y.parameterdef = paramdef_pos_y
         const_pos_y.value = y
 
-        logger.info(f"Shifting to {effect.x - shift_left}, {effect.y - shift_down}")
+        scale_factor_x = max_source_width / source_width
+        logger.info(f"Shifting to {effect.x - shift_left}, {effect.y - shift_down}, scale_factor={scale_factor_x}")
         logger.info(f"Shifting floats {float(x)}, {float(y)}")
 
         # Add ConstantValues to the position operation group
@@ -1179,6 +1211,8 @@ class VideoTrackTranscriber(_TrackTranscriber):
 
         width = descriptor.get("StoredWidth", 1920)
         height = descriptor.get("StoredHeight", 1080)
+        source_width = width
+        source_height = height
 
         if self._canvas_size is not None:
             shift_left = (int(self._canvas_size.x) - width) // 2
@@ -1210,7 +1244,8 @@ class VideoTrackTranscriber(_TrackTranscriber):
             elif isinstance(e, otio.schema.VideoPosition):
                 logger.debug(f"Processing VideoPosition effect: {e}")
                 next = self._chain_operation(AAF_OPERATIONDEF_VIDEOPOSITION, "Video Position", length, next)
-                self._add_position_params(e, next, shift_left, shift_down)
+                self._add_position_params(e, next, shift_left, shift_down, source_width, source_height,
+                                         self._max_source_size[0], self._max_source_size[1])
                 shift_left = shift_down = 0
             elif isinstance(e, otio.schema.VideoRotate):
                 logger.debug(f"Processing VideoRotation effect: {e}")
